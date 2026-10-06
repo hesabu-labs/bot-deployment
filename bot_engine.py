@@ -179,9 +179,6 @@ _REPORT_TAGS = ["SUMMARY", "ANALYSIS", "MARKETS", "VERDICT"]
 
 def parse_report(raw_text: str) -> dict:
     def extract(tag, text):
-        # Only the four known top-level tags end a section - this matters because
-        # the MARKETS section itself contains sub-lines like "BTTS:" and "Goals:"
-        # that would otherwise look like new section headers to a generic [A-Z]+: match.
         other_tags = "|".join(t for t in _REPORT_TAGS if t != tag)
         pattern = rf"{tag}:\s*(.*?)(?=\n(?:{other_tags}):|\Z)"
         m = re.search(pattern, text, re.DOTALL)
@@ -194,7 +191,6 @@ def parse_report(raw_text: str) -> dict:
     verdict = verdict_match.group(1) if verdict_match else "REJECT"
 
     if not summary and not markets and not analysis:
-        # Model didn't follow the structure - fall back to showing everything raw
         analysis = raw_text
         summary = (raw_text[:280] + "...") if len(raw_text) > 280 else raw_text
         markets = ""
@@ -213,8 +209,10 @@ async def run_grounded_audit(prompt: str) -> str:
         )
         return response.text
     except Exception as e:
-        if "503" in str(e) or "UNAVAILABLE" in str(e):
-            await asyncio.sleep(3)
+        error_msg = str(e)
+        if any(code in error_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+            logger.warning(f"API Congestion/Rate Limit hit. Backing off for 5s... ({error_msg})")
+            await asyncio.sleep(5)
             try:
                 response = client.models.generate_content(
                     model=GEMINI_MODEL, contents=prompt, config=GROUNDING_CONFIG
@@ -237,7 +235,10 @@ async def send_chunked(bot, chat_id, text):
 async def run_audits(chat_id, chosen_matches, bot):
     markets_pref = storage.get_market_prefs(chat_id)
 
-    for match in chosen_matches:
+    for i, match in enumerate(chosen_matches):
+        if i > 0:
+            await asyncio.sleep(4)
+            
         allowed, used, cap = storage.check_and_increment_quota(chat_id, GEMINI_WEEKLY_QUOTA)
         if not allowed:
             await bot.send_message(
@@ -391,223 +392,3 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def result_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /result <audit_id> win|loss [home-away score, e.g. 2-1]")
-        return
-
-    try:
-        audit_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("audit_id must be a number - check /history for IDs.")
-        return
-
-    outcome = args[1].lower()
-    if outcome not in ("win", "loss"):
-        await update.message.reply_text("Outcome must be 'win' or 'loss'.")
-        return
-
-    audit = storage.get_audit(audit_id)
-    if not audit or audit["chat_id"] != chat_id:
-        await update.message.reply_text("Audit ID not found.")
-        return
-
-    storage.set_audit_outcome(audit_id, outcome)
-    msg = f"Logged audit #{audit_id} as {outcome}."
-
-    if len(args) >= 3 and re.match(r"^\d+-\d+$", args[2]):
-        hg, ag = (int(x) for x in args[2].split("-"))
-        home_elo = storage.get_elo(audit["home_team"])
-        away_elo = storage.get_elo(audit["away_team"])
-        new_home, new_away = pm.update_elo(home_elo, away_elo, hg, ag)
-        storage.set_elo(audit["home_team"], new_home)
-        storage.set_elo(audit["away_team"], new_away)
-        msg += (f" Elo updated from final score {hg}-{ag}: "
-                f"{audit['home_team']} {home_elo:.0f}→{new_home:.0f}, "
-                f"{audit['away_team']} {away_elo:.0f}→{new_away:.0f}.")
-    else:
-        msg += " (No score given, so Elo ratings weren't updated this time.)"
-
-    await update.message.reply_text(msg)
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    s = storage.audit_stats(chat_id)
-    if s["pass_total"] == 0 and s["reject_total"] == 0:
-        await update.message.reply_text("No logged outcomes yet. Use /result <audit_id> win|loss after each bet settles.")
-        return
-    lines = ["📊 *Audit track record (self-reported)*"]
-    if s["pass_total"]:
-        rate = s["pass_win"] / s["pass_total"] * 100
-        lines.append(f"PASS calls: {s['pass_total']}, hit rate {rate:.0f}%")
-    if s["reject_total"]:
-        lines.append(f"REJECT calls: {s['reject_total']}, would-have-won {s['reject_would_have_won']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def stake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Usage: /stake <amount>")
-        return
-    try:
-        amount = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Amount must be a number.")
-        return
-    existing = storage.get_open_stake(chat_id)
-    if existing:
-        await update.message.reply_text(
-            f"You already have an open stake of {existing['stake']} from {existing['created_at'][:10]}. "
-            f"Settle it first with /settle win <payout> or /settle loss."
-        )
-        return
-    lid = storage.open_stake(chat_id, amount)
-    await update.message.reply_text(f"Stake #{lid} of {amount} opened for this week.")
-
-
-async def settle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Usage: /settle win <payout> | /settle loss")
-        return
-    existing = storage.get_open_stake(chat_id)
-    if not existing:
-        await update.message.reply_text("No open stake to settle. Start one with /stake <amount>.")
-        return
-    status = context.args[0].lower()
-    if status not in ("win", "loss"):
-        await update.message.reply_text("First argument must be 'win' or 'loss'.")
-        return
-    payout = 0.0
-    if status == "win":
-        if len(context.args) < 2:
-            await update.message.reply_text("Usage: /settle win <payout amount>")
-            return
-        try:
-            payout = float(context.args[1])
-        except ValueError:
-            await update.message.reply_text("Payout must be a number.")
-            return
-    storage.settle_stake(existing["id"], status, payout)
-    extra = f" - payout {payout}" if status == "win" else ""
-    await update.message.reply_text(f"Stake #{existing['id']} settled as {status}{extra}.")
-
-
-async def ledger_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rows = storage.list_ledger(chat_id)
-    if not rows:
-        await update.message.reply_text("No ledger entries yet. Start with /stake <amount>.")
-        return
-    lines = ["📒 *Ledger (most recent first)*"]
-    for r in rows:
-        if r["status"] == "open":
-            lines.append(f"#{r['id']} {r['week']}: staked {r['stake']}, OPEN")
-        else:
-            lines.append(f"#{r['id']} {r['week']}: staked {r['stake']} → {r['status'].upper()} (payout {r['payout']})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    used, cap = storage.get_quota_usage(chat_id, GEMINI_WEEKLY_QUOTA)
-    await update.message.reply_text(f"Gemini calls used this week: {used}/{cap}.")
-
-
-# ---------------------------------------------------------------------------
-# Callback (button) handler
-# ---------------------------------------------------------------------------
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    data = query.data
-    await query.answer()
-
-    if data.startswith("tog:"):
-        fid = int(data.split(":")[1])
-        sess = SESSIONS.get(chat_id)
-        if not sess:
-            await query.edit_message_text("Session expired - run /audit again.")
-            return
-        sess["selected"].symmetric_difference_update({fid})
-        await query.edit_message_reply_markup(reply_markup=_fixture_keyboard(chat_id))
-
-    elif data == "runaudit":
-        sess = SESSIONS.get(chat_id)
-        if not sess or not sess["selected"]:
-            await query.edit_message_text("No matches selected. Run /audit again to pick some.")
-            return
-        chosen = [f for f in sess["fixtures"] if f["id"] in sess["selected"]]
-        text = "Confirm audit on:\n" + "\n".join(f"• {f['match']}" for f in chosen)
-        text += f"\n\nThis uses {len(chosen)} Gemini call(s) with search grounding (extra cost per call)."
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Confirm", callback_data="confirmaudit"),
-            InlineKeyboardButton("✖ Cancel", callback_data="cancelaudit"),
-        ]])
-        await query.edit_message_text(text, reply_markup=kb)
-
-    elif data == "confirmaudit":
-        sess = SESSIONS.get(chat_id)
-        if not sess:
-            await query.edit_message_text("Session expired - run /audit again.")
-            return
-        chosen = [f for f in sess["fixtures"] if f["id"] in sess["selected"]]
-        await query.edit_message_text(f"Running audit on {len(chosen)} match(es)...")
-        await run_audits(chat_id, chosen, context.bot)
-
-    elif data == "cancelaudit":
-        SESSIONS.pop(chat_id, None)
-        await query.edit_message_text("Audit cancelled.")
-
-    elif data.startswith("full:"):
-        audit_id = int(data.split(":")[1])
-        audit = storage.get_audit(audit_id)
-        if not audit:
-            await query.answer("Not found", show_alert=True)
-            return
-        await send_chunked(context.bot, chat_id, f"📄 *Full analysis — {audit['match']}*\n\n{audit['full_analysis']}")
-
-    elif data.startswith("mkt:"):
-        m = data.split(":", 1)[1]
-        enabled = set(storage.get_market_prefs(chat_id))
-        if m in enabled and len(enabled) > 1:
-            enabled.discard(m)
-        elif m not in enabled:
-            enabled.add(m)
-        storage.set_market_prefs(chat_id, [x for x in ALL_MARKETS if x in enabled])
-        await query.edit_message_reply_markup(reply_markup=_markets_keyboard(chat_id))
-
-    elif data == "mktdone":
-        await query.edit_message_text("Market preferences saved. Run /markets any time to change them.")
-
-
-def main():
-    storage.init_db()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("audit", audit_command))
-    app.add_handler(CommandHandler("markets", markets_command))
-    app.add_handler(CommandHandler("favorite", favorite_command))
-    app.add_handler(CommandHandler("unfavorite", unfavorite_command))
-    app.add_handler(CommandHandler("favorites", favorites_command))
-    app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("result", result_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("stake", stake_command))
-    app.add_handler(CommandHandler("settle", settle_command))
-    app.add_handler(CommandHandler("ledger", ledger_command))
-    app.add_handler(CommandHandler("quota", quota_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("[+] Bot core initialized (pure qualitative, V2). Polling for commands...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
