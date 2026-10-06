@@ -3,13 +3,15 @@ SQLite persistence layer for the ladder bot.
 Stdlib only (sqlite3) - no new external dependency.
 One file, one DB: ladder_bot.db, created next to wherever this runs.
 """
+import os
 import sqlite3
 import json
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
-DB_PATH = "ladder_bot.db"
-
+# Anchor the DB path to the directory where this script lives
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "ladder_bot.db")
 DEFAULT_MARKETS = ["1X2", "BTTS", "Goals", "Corners"]
 
 
